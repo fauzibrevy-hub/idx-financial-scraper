@@ -40,6 +40,8 @@ requests
 beautifulsoup4
 lxml
 yfinance
+playwright
+chromium
 ```
 
 ## Usage

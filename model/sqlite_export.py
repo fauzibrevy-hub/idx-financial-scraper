@@ -15,13 +15,20 @@ without touching this script (risk #4 in the plan).
 """
 import argparse
 import csv
+import logging
 import sqlite3
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # CSV columns that are NOT metrics (identity / provenance / non-Tier-1 source).
 NON_METRIC_COLUMNS = {
     "ticker", "year", "period", "currency", "fx_rate_at_report", "revenue_tag_source",
 }
+
+# Metrics that are NOT money: an FX conversion must never touch these (a share
+# count is not USD, so multiplying it by the rate would be nonsense).
+NON_MONETARY_METRICS = {"outstanding_shares"}
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
@@ -41,7 +48,10 @@ CREATE TABLE metrics (
     year        INTEGER NOT NULL,
     period      TEXT    NOT NULL,   -- Q1|Q2|Q3|FY
     metric      TEXT    NOT NULL,   -- revenue, net_income, total_assets, ...
-    value       REAL,               -- full Rupiah (XBRL native unit)
+    value       REAL,               -- full Rupiah, ready to consume (IDR)
+    native_value REAL,              -- value in the filing's own currency (USD for some)
+    native_currency TEXT,           -- currency as reported in the source filing
+    fx_rate     REAL,               -- source-filing rate used (1.0 for IDR)
     source_file TEXT,               -- XBRL path for traceability
     PRIMARY KEY (ticker, year, period, metric)
 );
@@ -132,15 +142,47 @@ def export(data_dir: Path, db_path: Path) -> dict:
                 tickers_seen.add(ticker)
                 source_file = _source_file(ticker, year, period)
 
+                # Decision #1 settled 2026-10-07: store BOTH units. `native_value`
+                # keeps the figure exactly as reported (USD for BUMI/LEAD/SOCI),
+                # `value` is that figure in full Rupiah so cross-emiten comparison
+                # is valid. The rate is fx_rate_at_report from the source filing.
+                currency = (row.get("currency") or "IDR").strip().upper()
+                fx = _to_float(row.get("fx_rate_at_report"))
+                if currency == "IDR":
+                    factor = 1.0
+                elif fx and fx > 0:
+                    factor = fx
+                else:
+                    # No source rate: still import the filing's own figure (native),
+                    # but leave `value` NULL rather than pass USD off as Rupiah.
+                    factor = None
+                    logger.warning(
+                        "%s %s %s: currency=%s with no fx_rate_at_report; "
+                        "stored native only, Rupiah value left NULL",
+                        ticker, year, period, currency,
+                    )
+
                 for col in metric_cols:
                     value = _to_float(row.get(col))
                     if value is None:
                         continue  # keep blanks NULL, don't store a fake 0
-                    metric_rows.append((ticker, year, period, col, value, source_file))
+                    # Shares are not money: `value` equals `native_value` (no FX),
+                    # so the figure is still present and usable — only the rate is
+                    # left unset to make clear no conversion was applied.
+                    monetary = col not in NON_MONETARY_METRICS
+                    if monetary:
+                        idr = (value * factor) if factor else None
+                    else:
+                        idr = value
+                    metric_rows.append(
+                        (ticker, year, period, col, idr, value, currency,
+                         (factor if monetary else None), source_file)
+                    )
 
         conn.executemany(
             "INSERT OR REPLACE INTO metrics "
-            "(ticker, year, period, metric, value, source_file) VALUES (?, ?, ?, ?, ?, ?)",
+            "(ticker, year, period, metric, value, native_value, native_currency, "
+            " fx_rate, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             metric_rows,
         )
         conn.commit()

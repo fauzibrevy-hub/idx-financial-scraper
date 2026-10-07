@@ -179,9 +179,9 @@ async def run(args):
         logger.warning("No tickers to process.")
         return
 
-    import csv as _csv
-    failed = open(failed_path, "a", newline="", encoding="utf-8")
-    failed_writer = _csv.writer(failed)
+    # Collect misses in memory; write deduped at the end so re-runs don't keep
+    # appending the same absent filing (e.g. MSTI before its IPO).
+    failed_rows: list = []
 
     ws_url = cdp_page(args.port)
     downloaded = skipped = missing = 0
@@ -208,7 +208,7 @@ async def run(args):
                     body = await download_one(cdp, ticker, url)
                     if not body:
                         missing += 1
-                        failed_writer.writerow([ticker, year, period_tag, url])
+                        failed_rows.append([ticker, year, period_tag, url])
                         continue
                     # instance.zip wraps the real filing: it contains
                     # `instance.xbrl` (+ Taxonomy.xsd). Existing data/XBRL files
@@ -216,7 +216,7 @@ async def run(args):
                     xml = _extract_instance(body)
                     if xml is None:
                         missing += 1
-                        failed_writer.writerow([ticker, year, period_tag, url, "no instance.xbrl in zip"])
+                        failed_rows.append([ticker, year, period_tag, url, "no instance.xbrl in zip"])
                         logger.warning("%s %s %s: zip had no instance.xbrl", ticker, year, period_tag)
                         continue
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -227,12 +227,18 @@ async def run(args):
                     await _asyncio.sleep(REQUEST_DELAY_SECONDS)
                 logger.info("Finished %s %s", year, period_folder)
 
-    failed.close()
+    # Rewrite the whole file with the current run's misses, deduped and sorted:
+    # idempotent across re-runs instead of growing forever.
+    if failed_rows:
+        unique = sorted({tuple(r) for r in failed_rows}, key=lambda r: (r[0], r[1], r[2]))
+        with open(failed_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f)
+            w.writerows(unique)
     logger.info(
         "Backfill done: %d downloaded, %d already present, %d missing/blocked",
         downloaded, skipped, missing,
     )
-    if missing:
+    if failed_rows:
         logger.info("Missing entries logged to %s", failed_path)
 
 

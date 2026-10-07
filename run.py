@@ -18,6 +18,7 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parents[0] / "data"
 MASTER_SCRIPT = "model/master-data.py"
 FETCH_SCRIPT = "model/fetch_idx.py"
 PARSE_SCRIPT = "model/arelle_loader.py"
+EXPORT_SCRIPT = "model/sqlite_export.py"
 
 
 def run_step(name: str, script: str, args: list) -> None:
@@ -96,6 +97,10 @@ def main() -> int:
         steps.append(("IDX download", FETCH_SCRIPT, base_args + watchlist_args + year_args))
     if not args.skip_parse:
         steps.append(("XBRL parsing", PARSE_SCRIPT, base_args + year_args))
+    # Export runs whenever parsing did: it is a pure, idempotent rebuild of
+    # data/idx.sqlite from the CSV (plan idx-data-mc-design.md, Option A).
+    if not args.skip_parse:
+        steps.append(("SQLite export", EXPORT_SCRIPT, base_args))
 
     if not steps:
         logger.warning("All steps were skipped, nothing to do")

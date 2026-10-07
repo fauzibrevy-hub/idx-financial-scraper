@@ -25,12 +25,23 @@ EMITEN_FIELDS = [
     "taxonomy_type", "is_active", "created_at",
 ]
 
-REPORT_FIELDS = [
-    "ticker", "year", "period", "currency", "fx_rate_at_report",
-    "total_assets", "current_assets", "total_liabilities", "current_liabilities",
-    "total_equity", "revenue", "net_income", "operating_cash_flow",
-    "outstanding_shares", "capital_expenditure", "revenue_tag_source",
-]
+# Single source of truth for the reports CSV shape: arelle_loader owns the
+# metric list. Hardcoding a copy here silently DROPPED columns whenever a new
+# metric was added (the master-data step rewrites financial_reports.csv from
+# these fields), so derive it instead (plan risk #4). Fallback keeps this
+# module importable on its own.
+try:
+    from arelle_loader import OUTPUT_FIELDS as REPORT_FIELDS
+except ImportError:  # standalone import (e.g. unusual sys.path)
+    REPORT_FIELDS = [
+        "ticker", "year", "period", "currency", "fx_rate_at_report",
+        "total_assets", "current_assets", "total_liabilities", "current_liabilities",
+        "total_equity", "revenue", "gross_profit", "operating_profit", "net_income",
+        "cash_and_equivalents", "operating_cash_flow",
+        "outstanding_shares", "capital_expenditure",
+        "depreciation", "receivables", "inventories", "dividends_paid", "borrowings",
+        "revenue_tag_source",
+    ]
 
 
 def classify_taxonomy(sector: str, industry: str) -> str:

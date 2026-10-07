@@ -73,8 +73,13 @@ REVENUE_TAG_PATTERNS = [
 
 METRIC_FIELDS = [
     "total_assets", "current_assets", "total_liabilities", "current_liabilities",
-    "total_equity", "revenue", "net_income", "operating_cash_flow",
+    "total_equity", "revenue", "gross_profit", "operating_profit", "net_income",
+    "cash_and_equivalents", "operating_cash_flow",
     "outstanding_shares", "capital_expenditure",
+    # Tier-1 additions (plan idx-data-mc-design.md): tags verified present in the
+    # IDX idx-cor namespace. A blank here means the tag is absent from that
+    # filing (e.g. banks carry no Inventories) — never fabricated as 0.
+    "depreciation", "receivables", "inventories", "dividends_paid", "borrowings",
 ]
 
 OUTPUT_FIELDS = (
@@ -238,7 +243,9 @@ def process_filing(ticker: str, year: int, period: str, tax_type: str,
         "revenue_tag_source": revenue_tag_source or "",
     }
     for field in METRIC_FIELDS:
-        row[field] = metrics.get(field, 0)
+        # Absent tag -> blank, NOT 0. A fabricated zero is indistinguishable from
+        # a real zero and would render as a false figure downstream (plan risk #3).
+        row[field] = metrics.get(field, "")
     return row
 
 

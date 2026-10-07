@@ -1,0 +1,14 @@
+# Generated / fetched data — never commit (hundreds of MB, reproducible).
+data/XBRL/
+data/chrome_profile/
+data/financial_reports.csv
+data/idx.sqlite
+data/emitens.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Temp
+*.csv.tmp

@@ -19,6 +19,10 @@ MASTER_SCRIPT = "model/master-data.py"
 FETCH_SCRIPT = "model/fetch_idx.py"
 PARSE_SCRIPT = "model/arelle_loader.py"
 EXPORT_SCRIPT = "model/sqlite_export.py"
+# model/backfill_cdp.py is NOT part of this pipeline: it needs a Chrome with a
+# remote-debugging port already running, and drives CDP directly (see the module
+# docstring). Run it separately to pull historical years, then re-run this
+# pipeline so the new XBRL is parsed and exported.
 
 
 def run_step(name: str, script: str, args: list) -> None:

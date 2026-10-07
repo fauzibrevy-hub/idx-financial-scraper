@@ -12,3 +12,4 @@ __pycache__/
 
 # Temp
 *.csv.tmp
+data/failed_downloads.csv

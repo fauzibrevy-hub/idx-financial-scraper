@@ -203,6 +203,44 @@ def resolve_revenue_fallback(facts: dict):
             return pick_value(entries), f"heuristic:{pattern}"
     return None, "not_found"
 
+# Interest-bearing debt is the SUM of several XBRL tags, not the first one that
+# resolves (plan §110 "multi-tag", decision #4: finance lease liability is
+# included). resolve_metric returns the FIRST hit, which is wrong for a sum —
+# these metrics take a dedicated additive path instead. Missing tags count as
+# 0 in the sum (they genuinely contribute nothing), but the metric stays blank
+# if NO tag produced a value.
+MULTI_TAG_SUM = {
+    "borrowings": [
+        "LongTermOtherBorrowings",
+        "BankLoans",
+        "LongTermBorrowings",
+        "ShortTermBorrowings",
+        "CurrentMaturities",
+        "FinanceLeaseLiabilities",
+    ],
+}
+
+
+def resolve_sum(candidate_tags: list, facts: dict):
+    """Additive resolution: sum every tag that carries a numeric fact.
+
+    Returns (total, tags_used) or (None, []) when none of the tags has a value —
+    so an emitter with no borrowings stays blank rather than becoming 0.
+    """
+    total = 0.0
+    used = []
+    for tag in candidate_tags:
+        clean_tag = tag.split(":")[-1]
+        entries = facts.get(clean_tag, [])
+        if not entries:
+            continue
+        value = pick_value(entries)
+        if value is None:
+            continue
+        total += value
+        used.append(clean_tag)
+    return (total, used) if used else (None, [])
+
 
 def process_filing(ticker: str, year: int, period: str, tax_type: str,
                    taxonomy_maps: dict, xbrl_path: Path) -> dict:
@@ -224,6 +262,13 @@ def process_filing(ticker: str, year: int, period: str, tax_type: str,
             metrics[term] = value
         if term == "revenue":
             revenue_tag_source = tag_source
+
+    # Additive metrics (see MULTI_TAG_SUM) OVERRIDE the first-hit result: e.g.
+    # borrowings must be the sum of all debt tags, finance lease included.
+    for term, tags in MULTI_TAG_SUM.items():
+        total, used = resolve_sum(tags, facts)
+        if total is not None:
+            metrics[term] = total
 
     if "revenue" not in metrics:
         value, tag_source = resolve_revenue_fallback(facts)

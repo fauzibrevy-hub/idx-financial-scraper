@@ -58,7 +58,10 @@ except ImportError:
         _RATE_CACHE[cache_key] = rate
         return rate
 
-PERIODS = ["Q1", "Q2", "Q3"]
+# FY (the Audit folder) is parsed too: 33 annual filings sit on disk with full
+# data (assets, revenue, profit) and the UI advertises Q4 = FY - sum(Q1..Q3),
+# which is impossible unless FY is in the DB. Period stays 'FY' verbatim.
+PERIODS = ["Q1", "Q2", "Q3", "FY"]
 
 REVENUE_TAG_PATTERNS = [
     "SalesAndRevenue",
@@ -182,9 +185,21 @@ def extract_numeric_facts(soup: BeautifulSoup, context_map: dict) -> dict:
     return facts
 
 
-def pick_value(entries: list) -> float:
+def pick_value(entries: list):
+    """Value for the CURRENT reporting period, or None.
+
+    Falls back to 'entries[0]' ONLY when no context label is recognisable
+    ('Unknown'); it must NEVER borrow a 'Prior' figure, which is the previous
+    year's balance and would silently misstate the current period. That bug put
+    LEAD's prior-year LongTermBankLoans into the current quarter. A tag present
+    only for Prior returns None — the metric is simply absent this period.
+    """
     current = [e for e in entries if "Current" in e["c"]]
-    return current[0]["v"] if current else entries[0]["v"]
+    if current:
+        return current[0]["v"]
+    if entries and "Prior" not in entries[0]["c"]:
+        return entries[0]["v"]  # unknown context: better than nothing
+    return None
 
 
 def resolve_metric(candidate_tags: list, facts: dict):
@@ -203,33 +218,65 @@ def resolve_revenue_fallback(facts: dict):
             return pick_value(entries), f"heuristic:{pattern}"
     return None, "not_found"
 
-# Interest-bearing debt is the SUM of several XBRL tags, not the first one that
-# resolves (plan §110 "multi-tag", decision #4: finance lease liability is
-# included). resolve_metric returns the FIRST hit, which is wrong for a sum —
-# these metrics take a dedicated additive path instead. Missing tags count as
-# 0 in the sum (they genuinely contribute nothing), but the metric stays blank
-# if NO tag produced a value.
-MULTI_TAG_SUM = {
-    "borrowings": [
-        "LongTermOtherBorrowings",
-        "BankLoans",
-        "LongTermBorrowings",
-        "ShortTermBorrowings",
-        "CurrentMaturities",
-        "FinanceLeaseLiabilities",
-    ],
+# Interest-bearing debt = SUM of several XBRL tags (plan §110 "multi-tag";
+# decision #4 includes finance lease liability). Verified against the real
+# filings: the debt components differ per emitter (UNTR: ShortTermBankLoans +
+# CurrentMaturities*; BUMI: BankLoans + LongTermBankLoans) and some tags are
+# ALIASES of each other (`BankLoans` == `CurrentMaturitiesOfBankLoans`,
+# `TotalBankLoanGross`/`BankLoanAmountInForeignCurrency` mirror `BankLoans`), so
+# summing them naively double-counts. Components below were each confirmed to be
+# a distinct line in the statement of financial position.
+DEBT_COMPONENTS = [
+    "ShortTermBankLoans",
+    "CurrentMaturitiesOfBankLoans",
+    "LongTermBankLoans",
+    "CurrentMaturitiesOfFinanceLeaseLiabilities",
+    "LongTermFinanceLeaseLiabilities",
+    "CurrentMaturitiesOfOtherBorrowings",
+    "LongTermOtherBorrowings",
+    "ShortTermOtherBorrowings",
+    "BondsPayable",
+    "CurrentMaturitiesOfBondsPayable",
+    "LongTermBondsPayable",
+]
+
+# Tags that duplicate another tag's value in the same filing. If the canonical
+# component is present, the alias is skipped so the figure is not counted twice.
+DEBT_ALIASES = {
+    "BankLoans": "CurrentMaturitiesOfBankLoans",
+    "TotalBankLoanGross": "CurrentMaturitiesOfBankLoans",
+    "BankLoanAmountInForeignCurrency": "CurrentMaturitiesOfBankLoans",
 }
 
+# Aliases come last: they only contribute when their canonical tag is absent
+# (e.g. BUMI carries BankLoans but not CurrentMaturitiesOfBankLoans).
+MULTI_TAG_SUM = {
+    "borrowings": DEBT_COMPONENTS + list(DEBT_ALIASES),
+}
+DEBT_ALIAS_MAP = DEBT_ALIASES
 
-def resolve_sum(candidate_tags: list, facts: dict):
+
+def resolve_sum(candidate_tags: list, facts: dict, aliases: dict | None = None):
     """Additive resolution: sum every tag that carries a numeric fact.
 
-    Returns (total, tags_used) or (None, []) when none of the tags has a value —
-    so an emitter with no borrowings stays blank rather than becoming 0.
+    `aliases` maps a tag to the canonical tag it mirrors; an alias is skipped
+    whenever its canonical tag already contributed, preventing double-counting.
+    Returns (total, tags_used) or (None, []) when nothing resolved — so an
+    emitter with no borrowings stays blank rather than becoming 0.
     """
     total = 0.0
     used = []
+
+    def _resolves(tag: str) -> bool:
+        # "Present" must mean "has a value for THIS period" — a tag carrying only
+        # a Prior fact resolves to None, so the alias it mirrors should still
+        # contribute instead of being wrongly skipped.
+        entries = facts.get(tag, [])
+        return bool(entries) and pick_value(entries) is not None
+
     for tag in candidate_tags:
+        if aliases and tag in aliases and _resolves(aliases[tag]):
+            continue  # canonical tag already covers this value
         clean_tag = tag.split(":")[-1]
         entries = facts.get(clean_tag, [])
         if not entries:
@@ -266,9 +313,10 @@ def process_filing(ticker: str, year: int, period: str, tax_type: str,
     # Additive metrics (see MULTI_TAG_SUM) OVERRIDE the first-hit result: e.g.
     # borrowings must be the sum of all debt tags, finance lease included.
     for term, tags in MULTI_TAG_SUM.items():
-        total, used = resolve_sum(tags, facts)
+        total, used = resolve_sum(tags, facts, aliases=DEBT_ALIAS_MAP)
         if total is not None:
             metrics[term] = total
+            logger.debug("%s [%s %s] %s = %s from %s", ticker, period, year, term, total, used)
 
     if "revenue" not in metrics:
         value, tag_source = resolve_revenue_fallback(facts)

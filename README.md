@@ -97,6 +97,26 @@ python run.py --data-dir "D:\path\to\data"
 python run.py --watchlist "D:\path\to\custom_watchlist.csv"
 ```
 
+## Chrome location
+
+The report scraping stage drives a real Chrome over its remote-debugging port. `run.py` looks for the
+executable in this order: `--chrome-path`, the `IDX_CHROME_PATH` environment variable, then the standard
+install locations for the platform (`/Applications/Google Chrome.app`, `~/Applications/Google Chrome.app`, and
+`/Applications/Chromium.app` on macOS, `google-chrome`/`chromium` on `PATH` on Linux, Program Files on Windows). A path given explicitly
+must be an executable file; `~` is expanded, and on macOS a `.app` bundle is mapped to the executable inside
+it. A wrong explicit value stops the pipeline before any step runs, even if a Chrome is already listening on the
+debug port, so a stale `IDX_CHROME_PATH` is noticed. If nothing is set and nothing is found, the stage still
+attaches to a Chrome already listening on the debug port.
+
+The resolved path is passed to `model/fetch_idx.py --chrome-path`, so running `fetch_idx.py` on its own on
+macOS or Linux still needs `--chrome-path`.
+
+```bash
+# macOS or Linux, non-standard install
+IDX_CHROME_PATH="/opt/chrome/Google Chrome" python run.py --skip-master
+python run.py --skip-master --chrome-path "/opt/chrome/Google Chrome"
+```
+
 ## Combining flags
 
 All options can be combined as needed:

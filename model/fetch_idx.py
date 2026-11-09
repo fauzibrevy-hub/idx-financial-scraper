@@ -4,6 +4,8 @@ import csv
 import io
 import logging
 import os
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -46,7 +48,12 @@ CHROME_CANDIDATES = [
 ]
 
 DEFAULT_DEBUG_PORT = 9222
-CHROME_START_TIMEOUT_SECONDS = 30
+# A cold start of the real Chrome took 13 s on an idle Mac and more than 30 s on 2026-11-08 (first
+# start after a Chrome update, under heavy load, as a background LaunchAgent). Waiting longer costs
+# nothing when Chrome is fast; --chrome-start-timeout overrides it.
+CHROME_START_TIMEOUT_SECONDS = 90
+CHROME_STOP_TIMEOUT_SECONDS = 15
+SINGLETON_FILES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
 REQUEST_DELAY_SECONDS = 2.0
 PERIOD_DELAY_SECONDS = 10
@@ -75,6 +82,10 @@ class BlockedError(RuntimeError):
     pass
 
 
+class ChromeStartError(RuntimeError):
+    pass
+
+
 def debug_port_is_open(port: int) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2):
@@ -97,16 +108,116 @@ def find_chrome(explicit_path):
     )
 
 
-def ensure_chrome_running(port: int, profile_dir: Path, chrome_path) -> None:
+def singleton_lock_owner(profile_dir: Path):
+    """(host, pid) from the profile's SingletonLock, (target, None) when it cannot be parsed, or None.
+
+    Chrome writes SingletonLock as a symlink to "<hostname>-<pid>" and removes it only on a normal
+    quit; a Chrome stopped by a signal (launchd tearing down the job, a kill) leaves it behind.
+    """
+    try:
+        target = os.readlink(profile_dir / "SingletonLock")
+    except OSError:
+        return None
+    host, sep, pid = target.rpartition("-")
+    if not sep or not host or not pid.isdigit():
+        return (target, None)
+    return (host, int(pid))
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _process_uses_profile(pid: int, profile_dir: Path) -> bool:
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True,
+                              timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True  # cannot tell: treat the profile as in use rather than delete a live lock
+    return f"--user-data-dir={profile_dir}" in args or f"--user-data-dir={profile_dir.resolve()}" in args
+
+
+def remove_stale_singleton(profile_dir: Path) -> bool:
+    """Remove a SingletonLock left by a Chrome that is gone; True when something was removed.
+
+    Stale: the lock names this host and its pid is dead, or now belongs to a process that is not a
+    Chrome on this profile (pid reuse). Raises ChromeStartError when a live Chrome holds the profile,
+    when the lock names another host, or when the lock cannot be read: those are left alone.
+    """
+    owner = singleton_lock_owner(profile_dir)
+    if owner is None:
+        return False
+    host, pid = owner
+    if pid is None:
+        raise ChromeStartError(
+            f"Unreadable SingletonLock ({host!r}) in {profile_dir}; quit any Chrome using this profile, "
+            "then delete SingletonLock, SingletonSocket and SingletonCookie there."
+        )
+    if host != socket.gethostname():
+        raise ChromeStartError(
+            f"The Chrome profile {profile_dir} is locked by host {host} (pid {pid}), not this Mac; "
+            "quit Chrome there or delete its SingletonLock."
+        )
+    if _pid_alive(pid) and _process_uses_profile(pid, profile_dir):
+        raise ChromeStartError(
+            f"Chrome pid {pid} already uses the profile {profile_dir} but its debug port is closed; "
+            "quit that Chrome and run again."
+        )
+    for name in SINGLETON_FILES:
+        try:
+            (profile_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+    logger.info("Removed a stale Chrome profile lock (pid %d is gone)", pid)
+    return True
+
+
+def stop_chrome(proc, profile_dir: Path, timeout: float = CHROME_STOP_TIMEOUT_SECONDS) -> None:
+    """Stop a Chrome that ensure_chrome_running started (None: nothing was started, nothing to do).
+
+    SIGTERM, then SIGKILL after `timeout` seconds; then the lock it leaves behind is removed.
+    """
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning("Chrome pid %d did not stop within %ss, killing it", proc.pid, timeout)
+            proc.kill()
+            proc.wait(timeout=10)
+        logger.info("Stopped the Chrome this run started (pid %d)", proc.pid)
+    try:
+        remove_stale_singleton(profile_dir)
+    except ChromeStartError as e:
+        logger.warning("Chrome profile lock left in place: %s", e)
+
+
+def ensure_chrome_running(port: int, profile_dir: Path, chrome_path,
+                          timeout: float = CHROME_START_TIMEOUT_SECONDS):
+    """Attach to a Chrome on `port`, or start one; the started process, or None when attached.
+
+    The caller stops a started Chrome with stop_chrome(). On any failure here the Chrome this call
+    started is stopped before ChromeStartError is raised, so no window and no lock is left behind.
+    """
     if debug_port_is_open(port):
         logger.info("Chrome already listening on debug port %d, attaching", port)
-        return
+        return None
 
     exe = find_chrome(chrome_path)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    remove_stale_singleton(profile_dir)
 
     logger.info("Starting Chrome with profile %s", profile_dir)
-    subprocess.Popen(
+    started = time.monotonic()
+    proc = subprocess.Popen(
         [
             exe,
             f"--remote-debugging-port={port}",
@@ -115,20 +226,41 @@ def ensure_chrome_running(port: int, profile_dir: Path, chrome_path) -> None:
             "--no-default-browser-check",
             IDX_HOME,
         ],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
-    deadline = time.time() + CHROME_START_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        if debug_port_is_open(port):
-            return
-        time.sleep(0.5)
+    try:
+        while time.monotonic() - started < timeout:
+            if debug_port_is_open(port):
+                logger.info("Chrome debug port %d open after %.1fs (pid %d)",
+                            port, time.monotonic() - started, proc.pid)
+                return proc
+            code = proc.poll()
+            if code is not None:
+                raise ChromeStartError(
+                    f"Chrome (pid {proc.pid}) exited with code {code} after {time.monotonic() - started:.1f}s "
+                    f"before opening debug port {port}. Profile: {profile_dir}."
+                )
+            time.sleep(0.5)
+        raise ChromeStartError(
+            f"Chrome (pid {proc.pid}) did not open debug port {port} within {timeout:g}s; stopped it. "
+            "The Mac may be busy (another render or build), asleep, or this is the first start after a "
+            "Chrome update; run again, or raise --chrome-start-timeout."
+        )
+    except BaseException:
+        stop_chrome(proc, profile_dir)
+        raise
 
-    raise RuntimeError(
-        f"Chrome did not open debug port {port} within {CHROME_START_TIMEOUT_SECONDS}s. "
-        "Close all Chrome windows that use the same profile folder and try again."
-    )
+
+def install_signal_handlers() -> None:
+    """SIGTERM and SIGHUP raise SystemExit (143, 129) so `finally` blocks run and stop Chrome."""
+    def handler(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGHUP, handler)
 
 
 def load_watchlist(path: Path) -> list:
@@ -313,6 +445,8 @@ def parse_args() -> argparse.Namespace:
                         help="Chrome remote debugging port (default: %(default)s)")
     parser.add_argument("--chrome-path", type=str, default=None,
                         help="Full path to chrome.exe if it is not in a standard location")
+    parser.add_argument("--chrome-start-timeout", type=float, default=CHROME_START_TIMEOUT_SECONDS,
+                        help="Seconds to wait for a started Chrome to open its debug port (default: %(default)s)")
     return parser.parse_args()
 
 
@@ -337,36 +471,47 @@ def main() -> None:
 
     logger.info("Loaded %d tickers from %s", len(tickers), watchlist_path)
 
-    ensure_chrome_running(args.port, profile_dir, args.chrome_path)
+    # A TERM or HUP (launchd stopping the job, deploy/scraper.sh forwarding a signal) must still
+    # stop the Chrome this run started: as SystemExit it runs the `finally` below.
+    install_signal_handlers()
+    try:
+        chrome = ensure_chrome_running(args.port, profile_dir, args.chrome_path,
+                                       timeout=args.chrome_start_timeout)
+    except ChromeStartError as e:
+        logger.error("%s", e)
+        sys.exit(1)
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.pages[0] if context.pages else context.new_page()
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.pages[0] if context.pages else context.new_page()
 
-        try:
-            if "idx.co.id" not in page.url or page_is_challenge(page):
-                open_idx_home(page)
+            try:
+                if "idx.co.id" not in page.url or page_is_challenge(page):
+                    open_idx_home(page)
 
-            if page_is_challenge(page):
-                wait_for_manual_challenge(page)
+                if page_is_challenge(page):
+                    wait_for_manual_challenge(page)
 
-            for year in range(args.start_year, args.end_year + 1):
-                for period_folder, period_tag in periods:
-                    bulk_download(
-                        page, tickers, xbrl_dir, failed_log_path,
-                        year, period_folder, period_tag,
-                    )
-                    logger.info("Pausing before next period")
-                    time.sleep(PERIOD_DELAY_SECONDS)
+                for year in range(args.start_year, args.end_year + 1):
+                    for period_folder, period_tag in periods:
+                        bulk_download(
+                            page, tickers, xbrl_dir, failed_log_path,
+                            year, period_folder, period_tag,
+                        )
+                        logger.info("Pausing before next period")
+                        time.sleep(PERIOD_DELAY_SECONDS)
 
-            logger.info("All periods from %s to %s processed", args.start_year, args.end_year)
-        except BlockedError as e:
-            logger.error("%s Re-run later; existing files are skipped automatically.", e)
-        except KeyboardInterrupt:
-            logger.error("Interrupted by user; existing files are skipped on the next run.")
-        finally:
-            browser.close()
+                logger.info("All periods from %s to %s processed", args.start_year, args.end_year)
+            except BlockedError as e:
+                logger.error("%s Re-run later; existing files are skipped automatically.", e)
+            except KeyboardInterrupt:
+                logger.error("Interrupted by user; existing files are skipped on the next run.")
+            finally:
+                browser.close()  # over CDP this only disconnects; Chrome keeps running
+    finally:
+        stop_chrome(chrome, profile_dir)
 
     if failed_log_path.exists():
         logger.info("Some downloads failed; see %s", failed_log_path)

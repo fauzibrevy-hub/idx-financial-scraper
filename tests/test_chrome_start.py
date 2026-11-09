@@ -54,9 +54,18 @@ FAKE_CHROME = textwrap.dedent(
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/devtools/"):
+                # hang_ws: the websocket handshake of connect_over_cdp never completes
+                open(os.path.join(profile, "ws-requested"), "w").close()
+                time.sleep(3600)
+                return
+            body = '{"Browser": "FakeChrome/1.0"}'
+            if mode == "hang_ws":
+                body = ('{"Browser": "FakeChrome/1.0", "webSocketDebuggerUrl": '
+                        '"ws://127.0.0.1:%d/devtools/browser/fake"}' % port)
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b'{"Browser": "FakeChrome/1.0"}')
+            self.wfile.write(body.encode())
 
         def log_message(self, *a):
             pass
@@ -520,6 +529,129 @@ class ChromeStartTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(len(re.findall(r"\[ERROR\]", r.stderr)), 1, r.stderr)
 
+    def test_empty_ps_output_counts_as_a_chrome_only_while_the_pid_lives(self):
+        gone = dead_pid()
+        calls = []
+
+        def empty_ps(cmd, **_kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch.object(fetch_idx.subprocess, "run", side_effect=empty_ps):
+            self.assertTrue(fetch_idx._process_is_chrome(os.getpid()))  # alive, unreadable: keep the lock
+            self.assertFalse(fetch_idx._process_is_chrome(gone))        # gone: stale
+        self.assertTrue(calls)
+        self.assertTrue(all(c[0] == "/bin/ps" for c in calls), calls)
+
+    def test_port_must_be_1_to_65535(self):
+        for value in ("0", "-1", "65536", "x"):
+            with self.subTest(script="fetch_idx.py", value=value):
+                r = subprocess.run(self.fetch_cmd("--port", value), capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("--port", r.stderr)
+            with self.subTest(script="run.py", value=value):
+                r = subprocess.run([sys.executable, str(REPO / "run.py"), "--skip-master", "--skip-parse",
+                                    "--data-dir", str(self.tmp / "data"), "--watchlist", str(self.tmp / "watchlist.csv"),
+                                    "--chrome-path", str(self.chrome), "--port", value],
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("--port", r.stderr)
+
+    # --- a TERM that finds no Playwright call to cancel (stub Playwright, fake Chrome) -------------
+
+    STUB_PLAYWRIGHT = textwrap.dedent(
+        """\
+        class _Chromium:
+            def connect_over_cdp(self, url):
+                if TERM_DURING_CONNECT:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    time.sleep(0.3)
+                raise fetch_idx.PlaywrightError("stub connect failure")
+
+        class _PW:
+            chromium = _Chromium()
+
+        class _SyncPlaywright:
+            def __enter__(self):
+                if TERM_DURING_START:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    time.sleep(0.3)
+                return _PW()
+
+            def __exit__(self, *a):
+                return False
+
+        fetch_idx.sync_playwright = _SyncPlaywright
+        # As if the TERM landed inside Playwright's event loop while no call was in flight.
+        fetch_idx._in_playwright_dispatcher = lambda: True
+        """
+    )
+
+    def run_main_with_stub(self, prelude: str):
+        (self.tmp / "watchlist.csv").write_text("ticker\nUNTR\n")
+        args = ["--data-dir", str(self.tmp / "data"), "--watchlist", str(self.tmp / "watchlist.csv"),
+                "--start-year", "2025", "--end-year", "2025", "--periods", "FY",
+                "--port", str(self.port), "--chrome-path", str(self.chrome)]
+        code = ("import os, signal, sys, time\nsys.path.insert(0, %r)\nimport fetch_idx\n" % str(REPO / "model")
+                + textwrap.dedent(prelude) + self.STUB_PLAYWRIGHT
+                + "sys.argv = ['fetch_idx.py'] + %r\nfetch_idx.main()\n" % args)
+        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+
+    def started_chrome_pid(self, log: str) -> int:
+        return int(re.search(r"open after [0-9.]+s \(pid (\d+)\)", log).group(1))
+
+    def test_term_with_nothing_to_cancel_stops_before_the_next_call(self):
+        r = self.run_main_with_stub("TERM_DURING_START, TERM_DURING_CONNECT = True, False\n")
+        self.assertEqual(r.returncode, 143, r.stderr)
+        self.assertIn("[WARNING]", r.stderr)
+        self.assertIn("no browser call to cancel", r.stderr)
+        self.assertNotIn("stub connect failure", r.stderr)  # connect_over_cdp never ran
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(pid_alive(self.started_chrome_pid(r.stderr)))
+        self.assertEqual(self.singleton_files(self.tmp / "data" / "chrome_profile"), [])
+
+    def test_term_then_a_connect_failure_exits_143_not_1(self):
+        r = self.run_main_with_stub("TERM_DURING_START, TERM_DURING_CONNECT = False, True\n")
+        self.assertEqual(r.returncode, 143, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(pid_alive(self.started_chrome_pid(r.stderr)))
+
+    def test_a_failing_stop_chrome_after_a_term_keeps_exit_143(self):
+        r = self.run_main_with_stub(
+            "TERM_DURING_START, TERM_DURING_CONNECT = True, False\n"
+            "_real_stop = fetch_idx.stop_chrome\n"
+            "def _stop_then_fail(proc, profile_dir, **kw):\n"
+            "    _real_stop(proc, profile_dir, **kw)\n"
+            "    raise OSError('simulated failure while cleaning up')\n"
+            "fetch_idx.stop_chrome = _stop_then_fail\n")
+        self.assertEqual(r.returncode, 143, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("simulated failure while cleaning up", r.stderr)
+        self.assertFalse(pid_alive(self.started_chrome_pid(r.stderr)))
+
+    def test_term_during_connect_over_cdp_exits_143(self):
+        os.environ["FAKE_CHROME_MODE"] = "hang_ws"
+        log = self.tmp / "main.log"
+        with open(log, "w") as fh:
+            p = subprocess.Popen(self.fetch_cmd("--port", str(self.port), "--chrome-path", str(self.chrome)),
+                                 stdout=subprocess.DEVNULL, stderr=fh)
+        self.procs.append(p)
+        marker = self.tmp / "data" / "chrome_profile" / "ws-requested"
+        self.assertTrue(wait_until(marker.exists, 60), "connect_over_cdp never reached the fake:\n" + log.read_text())
+        time.sleep(0.3)
+        sent = time.monotonic()
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("still running 30 s after TERM:\n" + log.read_text())
+        text = log.read_text()
+        self.assertEqual(p.returncode, 143, text)
+        self.assertLess(time.monotonic() - sent, 10, text)
+        self.assertNotIn("Traceback", text)
+        self.assertFalse(pid_alive(self.started_chrome_pid(text)))
+        self.assertEqual(self.singleton_files(self.tmp / "data" / "chrome_profile"), [])
+
     def test_start_timeout_must_be_positive(self):
         for value in ("0", "-5", "nan", "inf", "-inf", "abc"):
             with self.subTest(value=value):
@@ -581,8 +713,8 @@ class ChromeStartTest(unittest.TestCase):
 
     # --- TERM while a real Playwright call is in flight (headless Google Chrome, local site) ------
 
-    def run_main_until_blocked(self, site, blocked: threading.Event):
-        """fetch_idx.main() against `site`; (process, Chrome pid, log path) once `blocked` is set."""
+    def start_real_main(self, site, prelude: str = ""):
+        """fetch_idx.main() with headless Google Chrome against `site`; (process, log path)."""
         if not os.path.exists(REAL_CHROME):
             self.skipTest("Google Chrome not installed")
         wrapper = self.tmp / "headless-chrome"
@@ -590,23 +722,23 @@ class ChromeStartTest(unittest.TestCase):
         wrapper.chmod(0o755)
         (self.tmp / "watchlist.csv").write_text("ticker\nUNTR\n")
         base = "http://127.0.0.1:%d" % site.port
-        code = textwrap.dedent(
-            """\
-            import sys
-            sys.path.insert(0, %r)
-            import fetch_idx
-            fetch_idx.IDX_HOME = %r
-            fetch_idx.IDX_URL_TEMPLATE = %r
-            sys.argv = ["fetch_idx.py"] + %r
-            fetch_idx.main()
-            """
-        ) % (str(REPO / "model"), base + "/home", base + "/file/{year}/{period_folder}/{ticker}/instance.zip",
-             ["--data-dir", str(self.tmp / "data"), "--watchlist", str(self.tmp / "watchlist.csv"),
-              "--start-year", "2025", "--end-year", "2025", "--periods", "FY",
-              "--port", str(free_port_for_real_chrome()), "--chrome-path", str(wrapper)])
+        args = ["--data-dir", str(self.tmp / "data"), "--watchlist", str(self.tmp / "watchlist.csv"),
+                "--start-year", "2025", "--end-year", "2025", "--periods", "FY",
+                "--port", str(free_port_for_real_chrome()), "--chrome-path", str(wrapper)]
+        code = ("import os, signal, sys, threading, time\nsys.path.insert(0, %r)\nimport fetch_idx\n"
+                "fetch_idx.IDX_HOME = %r\nfetch_idx.IDX_URL_TEMPLATE = %r\n"
+                % (str(REPO / "model"), base + "/home", base + "/file/{year}/{period_folder}/{ticker}/instance.zip")
+                + textwrap.dedent(prelude)
+                + "sys.argv = ['fetch_idx.py'] + %r\nfetch_idx.main()\n" % args)
         log = self.tmp / "main.log"
-        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=open(log, "w"))
+        with open(log, "w") as fh:  # Popen keeps its own copy of the descriptor
+            p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=fh)
         self.procs.append(p)
+        return p, log
+
+    def run_main_until_blocked(self, site, blocked: threading.Event):
+        """fetch_idx.main() against `site`; (process, Chrome pid, log path) once `blocked` is set."""
+        p, log = self.start_real_main(site)
         self.assertTrue(blocked.wait(90), "the Playwright call never reached the site:\n" + log.read_text())
         time.sleep(0.5)
         chrome_pid = int(re.search(r"open after [0-9.]+s \(pid (\d+)\)", log.read_text()).group(1))
@@ -625,7 +757,7 @@ class ChromeStartTest(unittest.TestCase):
         print("\n[term->exit %.1fs] " % (time.monotonic() - sent) + " | ".join(
             l[11:] for l in text.splitlines()[-5:]), file=sys.stderr)
         self.assertEqual(p.returncode, 143, text)
-        self.assertLess(time.monotonic() - sent, 5, text)
+        self.assertLess(time.monotonic() - sent, 10, text)  # 0.1-0.7 s measured; room for a loaded Mac
         self.assertNotIn("Traceback", text)
         self.assertIn("Stopped the Chrome this run started (pid %d)" % chrome_pid, text)
         self.assertFalse(pid_alive(chrome_pid))
@@ -640,6 +772,40 @@ class ChromeStartTest(unittest.TestCase):
         site = SlowSite(block_home=False)  # the download fetch, page.evaluate(), is in flight
         self.addCleanup(site.close)
         self.assert_term_ends_it(*self.run_main_until_blocked(site, site.file_blocked))
+
+    def test_term_during_the_playwright_driver_start_exits_143_without_navigating(self):
+        """A TERM while sync_playwright() starts its driver (nothing to cancel yet) must not let the
+        next call, page.goto() to the IDX home, run: here that goto would block for 60 s."""
+        site = SlowSite(block_home=True)
+        self.addCleanup(site.close)
+        sent_file = self.tmp / "term-sent"
+        p, log = self.start_real_main(site, prelude=(
+            "_real_sync_playwright = fetch_idx.sync_playwright\n"
+            "class _SyncPlaywright:\n"
+            "    def __enter__(self):\n"
+            "        self.cm = _real_sync_playwright()\n"
+            "        def term():\n"
+            "            open(%r, 'w').write(repr(time.time()))\n"
+            "            os.kill(os.getpid(), signal.SIGTERM)\n"
+            "        threading.Timer(0.05, term).start()\n"
+            "        return self.cm.__enter__()\n"
+            "    def __exit__(self, *a):\n"
+            "        return self.cm.__exit__(*a)\n"
+            "fetch_idx.sync_playwright = _SyncPlaywright\n" % str(sent_file)))
+        try:
+            p.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            self.fail("still running:\n" + log.read_text())
+        text = log.read_text()
+        took = time.time() - float(sent_file.read_text())
+        chrome_pid = int(re.search(r"open after [0-9.]+s \(pid (\d+)\)", text).group(1))
+        self.addCleanup(lambda: pid_alive(chrome_pid) and os.kill(chrome_pid, signal.SIGKILL))
+        self.assertEqual(p.returncode, 143, text)
+        self.assertLess(took, 10, text)
+        self.assertLessEqual(site.home_requests, 1, "page.goto() ran after the TERM:\n" + text)
+        self.assertNotIn("Traceback", text)
+        self.assertFalse(pid_alive(chrome_pid))
+        self.assertEqual(self.singleton_files(self.tmp / "data" / "chrome_profile"), [])
 
 
 if __name__ == "__main__":

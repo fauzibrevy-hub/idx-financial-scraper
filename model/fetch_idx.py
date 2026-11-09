@@ -181,15 +181,18 @@ def _process_is_chrome(pid: int, chrome_path=None) -> bool:
     Decided by the program, never by --user-data-dir: a Chrome may name the profile with a
     relative path, through a symlink (/tmp vs /private/tmp) or with a trailing slash.
     """
+    # Two calls on purpose: macOS ps cuts comm to 16 characters when another column follows it
+    # ("-o comm=,args=" gives "/Applications/Go"), which would hide a live Chrome.
     try:
-        comm = subprocess.run(["ps", "-ww", "-o", "comm=", "-p", str(pid)], capture_output=True,
-                              text=True, timeout=5).stdout.strip()
-        args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True,
-                              text=True, timeout=5).stdout.strip()
+        comm, args = (subprocess.run(["/bin/ps", "-ww", "-o", f"{field}=", "-p", str(pid)],
+                                     capture_output=True, text=True, timeout=5).stdout.strip()
+                      for field in ("comm", "args"))
     except (OSError, subprocess.SubprocessError):
         return True  # cannot tell: treat it as a Chrome rather than delete a live lock
     if not comm and not args:
-        return False  # gone between the liveness check and ps
+        # Nothing to read: gone since the liveness check (not a Chrome), or still there but
+        # unreadable, which is treated as a Chrome like any other unknown.
+        return _pid_alive(pid)
     return _is_chrome_program(_program_name(comm, args), chrome_path)
 
 
@@ -397,7 +400,11 @@ def install_signal_handlers() -> None:
         if _STOP["signum"] is None:
             _STOP["signum"] = signum
         if _in_playwright_dispatcher():
-            _cancel_playwright_calls()
+            if _cancel_playwright_calls() == 0:
+                # e.g. while sync_playwright() starts its driver, or between two calls: the stop
+                # is only the flag, so the next raise_if_stop_requested() check ends the run.
+                logger.warning("Signal %d came with no browser call to cancel; stopping before the next one",
+                               signum)
             return
         raise SystemExit(128 + _STOP["signum"])
 
@@ -445,6 +452,7 @@ def extract_xbrl(content: bytes):
 
 
 def open_idx_home(page) -> None:
+    raise_if_stop_requested()
     try:
         page.goto(IDX_HOME, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
@@ -476,6 +484,7 @@ def wait_for_manual_challenge(page) -> None:
 
 
 def fetch_in_browser(page, url: str):
+    raise_if_stop_requested()
     result = page.evaluate(FETCH_JS, url)
     status = result["status"]
     content = base64.b64decode(result["b64"]) if result.get("b64") else None
@@ -585,13 +594,23 @@ def parse_args() -> argparse.Namespace:
                         help="Optional subset of tickers, e.g. --tickers AALI ADRO")
     parser.add_argument("--periods", nargs="+", choices=PERIOD_TAGS, default=None,
                         help="Optional subset of periods, e.g. --periods Q1 FY")
-    parser.add_argument("--port", type=int, default=DEFAULT_DEBUG_PORT,
+    parser.add_argument("--port", type=port_number, default=DEFAULT_DEBUG_PORT,
                         help="Chrome remote debugging port (default: %(default)s)")
     parser.add_argument("--chrome-path", type=str, default=None,
                         help="Full path to chrome.exe if it is not in a standard location")
     parser.add_argument("--chrome-start-timeout", type=positive_seconds, default=CHROME_START_TIMEOUT_SECONDS,
                         help="Seconds to wait for a started Chrome to open its debug port (default: %(default)s)")
     return parser.parse_args()
+
+
+def port_number(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port number: {value!r}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"must be 1-65535, got {port}")
+    return port
 
 
 def positive_seconds(value: str) -> float:
@@ -637,14 +656,17 @@ def main() -> None:
 
     try:
         with sync_playwright() as pw:
+            raise_if_stop_requested()  # a TERM during the driver start
             try:
                 browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
                 page = context.pages[0] if context.pages else context.new_page()
             except PlaywrightError as e:
+                raise_if_stop_requested()  # a connect that failed after a TERM is the TERM's exit
                 first_line = (str(e).strip().splitlines() or ["no detail"])[0]
                 logger.error("Could not connect to Chrome on debug port %d: %s", args.port, first_line)
                 sys.exit(1)
+            raise_if_stop_requested()  # before the first navigation (page.goto waits up to 60 s)
 
             try:
                 if "idx.co.id" not in page.url or page_is_challenge(page):
@@ -685,8 +707,16 @@ def main() -> None:
     finally:
         if stop_requested() is not None:
             logger.error("Stopping on signal %d", stop_requested())
-        stop_chrome(chrome, profile_dir)
+        try:
+            stop_chrome(chrome, profile_dir)
+        except Exception as e:  # keep the run's own exit (143/129, 1, 0) instead of a traceback
+            logger.error("Could not stop the Chrome this run started: %s", e)
+            stop_failed = True
+        else:
+            stop_failed = False
     raise_if_stop_requested()
+    if stop_failed:
+        sys.exit(1)
 
     if failed_log_path.exists():
         logger.info("Some downloads failed; see %s", failed_log_path)

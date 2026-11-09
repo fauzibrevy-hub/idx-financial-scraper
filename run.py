@@ -177,6 +177,16 @@ def validate_inputs(args: argparse.Namespace, watchlist_path: Path) -> None:
             )
 
 
+def port_number(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port number: {value!r}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"must be 1-65535, got {port}")
+    return port
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the full pipeline: master data, IDX download, XBRL parsing."
@@ -192,7 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chrome-path", type=str, default=None,
                         help=f"Chrome executable for the IDX download step "
                              f"(default: ${CHROME_PATH_ENV}, then the standard install locations)")
-    parser.add_argument("--port", type=int, default=None,
+    parser.add_argument("--port", type=port_number, default=None,
                         help="Chrome remote debugging port for the IDX download step (default: the step's own)")
     parser.add_argument("--skip-master", action="store_true", help="Skip the master data step")
     parser.add_argument("--skip-fetch", action="store_true", help="Skip the IDX download step")

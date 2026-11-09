@@ -1,8 +1,10 @@
 import argparse
+import asyncio
 import base64
 import csv
 import io
 import logging
+import math
 import os
 import signal
 import socket
@@ -135,23 +137,60 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _process_is_chrome(pid: int) -> bool:
-    """True when the live process `pid` is a Chrome or Chromium (or cannot be checked).
+# Browser programs whose lock is never taken over while they run (compared case-insensitively).
+# The browser given with --chrome-path counts too (Edge, Brave, a renamed build). Helper processes
+# ("Google Chrome Helper (Renderer)") do not: a lock pid reused by a helper is stale.
+CHROME_PROGRAM_NAMES = {
+    "google chrome", "google chrome beta", "google chrome dev", "google chrome canary",
+    "google chrome for testing", "chromium", "chromium-browser", "chrome", "google-chrome",
+    "google-chrome-stable", "google-chrome-beta", "google-chrome-unstable", "chrome.exe", "chromium.exe",
+}
+_INTERPRETERS = {"env", "sh", "bash", "zsh", "dash", "node", "perl", "ruby"}
+
+
+def _program_name(comm: str, args: str) -> str:
+    """The program's name from `ps` comm (executable path) and args.
+
+    The executable's basename, so a path with spaces or " -" in it does not matter. For an
+    interpreter (python3, env, sh, ...) it is the script it runs instead.
+    """
+    name = os.path.basename(comm.strip())
+    lowered = name.lower()
+    if lowered not in _INTERPRETERS and not lowered.startswith("python"):
+        return name
+    for token in args.split():
+        base = os.path.basename(token)
+        if token.startswith("-") or base.lower() in _INTERPRETERS or base.lower().startswith("python"):
+            continue
+        return base
+    return name
+
+
+def _is_chrome_program(name: str, chrome_path=None) -> bool:
+    lowered = name.strip().casefold()
+    if not lowered or "helper" in lowered:
+        return False
+    if lowered in CHROME_PROGRAM_NAMES:
+        return True
+    return bool(chrome_path) and lowered == os.path.basename(str(chrome_path)).casefold()
+
+
+def _process_is_chrome(pid: int, chrome_path=None) -> bool:
+    """True when the live process `pid` is Chrome, Chromium or `chrome_path` (or cannot be checked).
 
     Decided by the program, never by --user-data-dir: a Chrome may name the profile with a
-    relative path, through a symlink (/tmp vs /private/tmp) or with a trailing slash. The program
-    is the command line before its first option, so a Chrome started through a script or
-    interpreter ("python3 .../fake-chrome --...") counts too.
+    relative path, through a symlink (/tmp vs /private/tmp) or with a trailing slash.
     """
     try:
+        comm = subprocess.run(["ps", "-ww", "-o", "comm=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
         args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True,
                               text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return True  # cannot tell: treat it as a Chrome rather than delete a live lock
-    if not args:
+    if not comm and not args:
         return False  # gone between the liveness check and ps
-    program = args.split(" -", 1)[0].lower()
-    return "chrome" in program or "chromium" in program
+    return _is_chrome_program(_program_name(comm, args), chrome_path)
 
 
 def _remove_singleton_if_unchanged(profile_dir: Path, target: str) -> bool:
@@ -171,13 +210,13 @@ def _remove_singleton_if_unchanged(profile_dir: Path, target: str) -> bool:
     return True
 
 
-def remove_stale_singleton(profile_dir: Path) -> bool:
+def remove_stale_singleton(profile_dir: Path, chrome_path=None) -> bool:
     """Remove a SingletonLock left by a Chrome that is gone; True when something was removed.
 
     Stale: the lock names this host and its pid is dead, or the pid now belongs to a process that
-    is not Chrome or Chromium (pid reuse). Raises ChromeStartError when a live Chrome or Chromium
-    has that pid (whatever profile path it was given), when the lock names another host, or when
-    the lock cannot be read: those are left alone.
+    is not Chrome, Chromium or `chrome_path` (pid reuse; a browser helper counts as not). Raises
+    ChromeStartError when such a live browser has that pid (whatever profile path it was given),
+    when the lock names another host, or when the lock cannot be read: those are left alone.
     """
     try:
         target = os.readlink(profile_dir / "SingletonLock")
@@ -197,7 +236,7 @@ def remove_stale_singleton(profile_dir: Path) -> bool:
             f"The Chrome profile {profile_dir} is locked by host {host} (pid {pid}), not this Mac; "
             "quit Chrome there or delete its SingletonLock."
         )
-    if _pid_alive(pid) and _process_is_chrome(pid):
+    if _pid_alive(pid) and _process_is_chrome(pid, chrome_path):
         raise ChromeStartError(
             f"Chrome pid {pid} holds the profile lock in {profile_dir} and is still running, but "
             "nothing answers on the debug port; quit that Chrome and run again."
@@ -229,8 +268,9 @@ def stop_chrome(proc, profile_dir: Path, timeout: float = CHROME_STOP_TIMEOUT_SE
                              proc.pid)
                 return
         logger.info("Stopped the Chrome this run started (pid %d)", proc.pid)
+    args = getattr(proc, "args", None)
     try:
-        remove_stale_singleton(profile_dir)
+        remove_stale_singleton(profile_dir, chrome_path=args[0] if isinstance(args, list) and args else None)
     except ChromeStartError as e:
         logger.warning("Chrome profile lock left in place: %s", e)
 
@@ -254,7 +294,7 @@ def ensure_chrome_running(port: int, profile_dir: Path, chrome_path,
         profile_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise ChromeStartError(f"Cannot create the Chrome profile folder {profile_dir}: {e}") from None
-    remove_stale_singleton(profile_dir)
+    remove_stale_singleton(profile_dir, chrome_path=exe)
 
     logger.info("Starting Chrome with profile %s", profile_dir)
     started = time.monotonic()
@@ -295,15 +335,71 @@ def ensure_chrome_running(port: int, profile_dir: Path, chrome_path,
         raise
 
 
-def install_signal_handlers() -> None:
-    """SIGTERM and SIGHUP raise SystemExit (143, 129) so `finally` blocks run and stop Chrome.
+_STOP = {"signum": None}
 
-    After the first one both are ignored: a second TERM must not interrupt the cleanup it started.
+
+def stop_requested():
+    """The signal number of the TERM/HUP that asked this run to stop, or None."""
+    return _STOP["signum"]
+
+
+def raise_if_stop_requested() -> None:
+    if _STOP["signum"] is not None:
+        raise SystemExit(128 + _STOP["signum"])
+
+
+def _in_playwright_dispatcher() -> bool:
+    """True while Playwright's sync API is pumping its event loop (a call is in flight).
+
+    The sync API runs the event loop in a child greenlet; the script itself runs in the root one.
     """
+    try:
+        import greenlet
+    except ImportError:
+        return False
+    return greenlet.getcurrent().parent is not None
+
+
+def _cancel_playwright_calls() -> int:
+    """Cancel the Playwright sync calls in flight; their caller then gets asyncio.CancelledError."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return 0
+    cancelled = 0
+    for task in asyncio.all_tasks(loop):
+        if hasattr(task, "__pw_stack__") and not task.done():  # tasks of the sync API's calls
+            task.cancel("stopped by a TERM/HUP")
+            cancelled += 1
+    # The handler runs while the loop waits in select(), which is retried after it with no
+    # wake-up of its own: without this the cancellation waits for the next I/O or timer (seconds
+    # for a page.goto, until the server answers for a page.evaluate).
+    loop.call_soon_threadsafe(lambda: None)
+    return cancelled
+
+
+def install_signal_handlers() -> None:
+    """On SIGTERM or SIGHUP, stop the run as exit 143 or 129 with `finally` blocks running.
+
+    Outside a Playwright call the handler raises SystemExit at once. Inside one (page.evaluate,
+    page.goto, ...) raising would land in Playwright's event loop and wedge it, so the next
+    browser.close() spins and the Chrome is never stopped. There it only cancels the call in
+    flight: the caller gets asyncio.CancelledError, main() turns that into the exit, and the loop
+    stays usable for the cleanup. stop_requested() and raise_if_stop_requested() let the
+    download loop stop at its next step. After the first signal both are ignored, so a second one
+    cannot interrupt the cleanup.
+    """
+    _STOP["signum"] = None
+
     def handler(signum, _frame):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        raise SystemExit(128 + signum)
+        if _STOP["signum"] is None:
+            _STOP["signum"] = signum
+        if _in_playwright_dispatcher():
+            _cancel_playwright_calls()
+            return
+        raise SystemExit(128 + _STOP["signum"])
 
     signal.signal(signal.SIGTERM, handler)
     signal.signal(signal.SIGHUP, handler)
@@ -401,6 +497,7 @@ def bulk_download(
     counts = {"saved": 0, "skipped_existing": 0, "not_found": 0, "blocked": 0, "http_error": 0, "errors": 0}
 
     for index, ticker in enumerate(tickers, start=1):
+        raise_if_stop_requested()
         target_file = target_dir / f"{ticker}_{year}_{period_tag}.xbrl"
 
         if target_file.exists():
@@ -464,6 +561,7 @@ def bulk_download(
         if index % PROGRESS_EVERY == 0:
             logger.info("Progress %s %s: %d/%d tickers", period_tag, year, index, len(tickers))
 
+        raise_if_stop_requested()
         time.sleep(REQUEST_DELAY_SECONDS)
 
     logger.info(
@@ -501,7 +599,7 @@ def positive_seconds(value: str) -> float:
         seconds = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
-    if not seconds > 0:  # also rejects nan
+    if not (math.isfinite(seconds) and seconds > 0):  # rejects nan and inf too
         raise argparse.ArgumentTypeError(f"must be more than 0 seconds, got {value}")
     return seconds
 
@@ -557,11 +655,13 @@ def main() -> None:
 
                 for year in range(args.start_year, args.end_year + 1):
                     for period_folder, period_tag in periods:
+                        raise_if_stop_requested()
                         bulk_download(
                             page, tickers, xbrl_dir, failed_log_path,
                             year, period_folder, period_tag,
                         )
                         logger.info("Pausing before next period")
+                        raise_if_stop_requested()
                         time.sleep(PERIOD_DELAY_SECONDS)
 
                 logger.info("All periods from %s to %s processed", args.start_year, args.end_year)
@@ -569,10 +669,24 @@ def main() -> None:
                 logger.error("%s Re-run later; existing files are skipped automatically.", e)
             except KeyboardInterrupt:
                 logger.error("Interrupted by user; existing files are skipped on the next run.")
+            except asyncio.CancelledError:
+                if stop_requested() is not None:
+                    logger.error("Browser call interrupted by signal %d", stop_requested())
+                raise
             finally:
-                browser.close()  # over CDP this only disconnects; Chrome keeps running
+                # Over CDP this only disconnects; Chrome keeps running. Skipped after a TERM/HUP:
+                # the cleanup must not wait on Playwright.
+                if stop_requested() is None:
+                    browser.close()
+    except asyncio.CancelledError:
+        if stop_requested() is None:
+            raise
+        # A TERM/HUP cancelled the Playwright call in flight (install_signal_handlers).
     finally:
+        if stop_requested() is not None:
+            logger.error("Stopping on signal %d", stop_requested())
         stop_chrome(chrome, profile_dir)
+    raise_if_stop_requested()
 
     if failed_log_path.exists():
         logger.info("Some downloads failed; see %s", failed_log_path)

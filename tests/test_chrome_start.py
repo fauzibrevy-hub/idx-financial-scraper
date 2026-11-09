@@ -285,8 +285,8 @@ class ChromeStartTest(unittest.TestCase):
         py = "/opt/py/Python.app/Contents/MacOS/Python"
         cases = [
             (REAL_CHROME, REAL_CHROME + " --remote-debugging-port=9222", "Google Chrome"),
-            ("/Users/a/My -Apps/Chromium.app/Contents/MacOS/Chromium",
-             "/Users/a/My -Apps/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/p", "Chromium"),
+            ("/Applications/My -Apps/Chromium.app/Contents/MacOS/Chromium",
+             "/Applications/My -Apps/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/p", "Chromium"),
             (py, py + " /tmp/x/fake-chrome --remote-debugging-port=1", "fake-chrome"),
             ("/usr/bin/env", "/usr/bin/env python3 /tmp/x/fake-chrome --x=1", "fake-chrome"),
             ("/bin/sleep", "sleep 30", "sleep"),
@@ -341,7 +341,7 @@ class ChromeStartTest(unittest.TestCase):
         self.plant_lock("%s-%d" % (socket.gethostname(), os.getpid()))
         replacement = "%s-%d" % (socket.gethostname(), 424242)
 
-        def another_chrome_takes_the_profile(_pid):
+        def another_chrome_takes_the_profile(*_args):
             os.unlink(self.profile / "SingletonLock")
             os.symlink(replacement, self.profile / "SingletonLock")
             return False
@@ -622,8 +622,10 @@ class ChromeStartTest(unittest.TestCase):
         except subprocess.TimeoutExpired:
             self.fail("still running 15 s after TERM:\n" + log.read_text())
         text = log.read_text()
+        print("\n[term->exit %.1fs] " % (time.monotonic() - sent) + " | ".join(
+            l[11:] for l in text.splitlines()[-5:]), file=sys.stderr)
         self.assertEqual(p.returncode, 143, text)
-        self.assertLess(time.monotonic() - sent, 10, text)
+        self.assertLess(time.monotonic() - sent, 5, text)
         self.assertNotIn("Traceback", text)
         self.assertIn("Stopped the Chrome this run started (pid %d)" % chrome_pid, text)
         self.assertFalse(pid_alive(chrome_pid))

@@ -103,14 +103,14 @@ def run_step(name: str, script: str, args: list) -> None:
     logger.info("Step started: %s", name)
     started = time.time()
 
-    proc = subprocess.Popen(command)
-
     # A TERM or HUP to this process (deploy/scraper.sh, launchd) is passed on to the running step
     # as TERM, so it can clean up (fetch_idx.py stops the Chrome it started); this process waits
     # for it, up to STEP_STOP_TIMEOUT_SECONDS, and exits with 128 + the signal. Further TERM/HUP
-    # are ignored meanwhile. The handler only sends the signal: waiting inside it would re-enter
-    # Popen.wait and deadlock on its lock, so the loop below does the waiting.
+    # are ignored meanwhile. The handlers are in place before the step starts, so a signal that
+    # arrives while Popen runs is not lost. The handler only sends the signal: waiting inside it
+    # would re-enter Popen.wait and deadlock on its lock, so the loop below does the waiting.
     received = []
+    step = {"proc": None}
 
     def forward(signum, _frame):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -119,12 +119,16 @@ def run_step(name: str, script: str, args: list) -> None:
             return
         received.append(signum)
         logger.error("Received signal %d, stopping step '%s'", signum, name)
-        if proc.poll() is None:
-            proc.terminate()
+        if step["proc"] is not None and step["proc"].poll() is None:
+            step["proc"].terminate()
 
     previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGHUP)}
     stop_deadline = None
     try:
+        proc = subprocess.Popen(command)
+        step["proc"] = proc
+        if received and proc.poll() is None:
+            proc.terminate()  # the signal came while the step was being started
         while proc.poll() is None:
             if received:
                 if stop_deadline is None:
@@ -137,7 +141,8 @@ def run_step(name: str, script: str, args: list) -> None:
             time.sleep(0.2)
     except KeyboardInterrupt:
         # Ctrl-C reaches the step too (same process group); let it finish its own cleanup.
-        _wait_for_step(proc)
+        if step["proc"] is not None:
+            _wait_for_step(step["proc"])
         raise
     finally:
         for s, handler in previous.items():
@@ -187,6 +192,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chrome-path", type=str, default=None,
                         help=f"Chrome executable for the IDX download step "
                              f"(default: ${CHROME_PATH_ENV}, then the standard install locations)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Chrome remote debugging port for the IDX download step (default: the step's own)")
     parser.add_argument("--skip-master", action="store_true", help="Skip the master data step")
     parser.add_argument("--skip-fetch", action="store_true", help="Skip the IDX download step")
     parser.add_argument("--skip-parse", action="store_true", help="Skip the XBRL parsing step")
@@ -216,6 +223,8 @@ def main() -> int:
             "running Chrome on the debug port or fail. Set %s or pass --chrome-path.",
             CHROME_PATH_ENV,
         )
+    if args.port is not None:
+        chrome_args += ["--port", str(args.port)]
 
     year_args = []
     if args.start_year is not None:

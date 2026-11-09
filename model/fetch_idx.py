@@ -14,6 +14,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 logging.basicConfig(
@@ -134,22 +135,54 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _process_uses_profile(pid: int, profile_dir: Path) -> bool:
+def _process_is_chrome(pid: int) -> bool:
+    """True when the live process `pid` is a Chrome or Chromium (or cannot be checked).
+
+    Decided by the program, never by --user-data-dir: a Chrome may name the profile with a
+    relative path, through a symlink (/tmp vs /private/tmp) or with a trailing slash. The program
+    is the command line before its first option, so a Chrome started through a script or
+    interpreter ("python3 .../fake-chrome --...") counts too.
+    """
     try:
-        args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True,
-                              timeout=5).stdout
+        args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return True  # cannot tell: treat the profile as in use rather than delete a live lock
-    return f"--user-data-dir={profile_dir}" in args or f"--user-data-dir={profile_dir.resolve()}" in args
+        return True  # cannot tell: treat it as a Chrome rather than delete a live lock
+    if not args:
+        return False  # gone between the liveness check and ps
+    program = args.split(" -", 1)[0].lower()
+    return "chrome" in program or "chromium" in program
+
+
+def _remove_singleton_if_unchanged(profile_dir: Path, target: str) -> bool:
+    """Delete the Singleton files only while SingletonLock still points at `target`."""
+    try:
+        if os.readlink(profile_dir / "SingletonLock") != target:
+            logger.warning("Chrome profile lock in %s changed while it was checked; left in place",
+                           profile_dir)
+            return False
+    except OSError:
+        return False  # already gone
+    for name in SINGLETON_FILES:
+        try:
+            (profile_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+    return True
 
 
 def remove_stale_singleton(profile_dir: Path) -> bool:
     """Remove a SingletonLock left by a Chrome that is gone; True when something was removed.
 
-    Stale: the lock names this host and its pid is dead, or now belongs to a process that is not a
-    Chrome on this profile (pid reuse). Raises ChromeStartError when a live Chrome holds the profile,
-    when the lock names another host, or when the lock cannot be read: those are left alone.
+    Stale: the lock names this host and its pid is dead, or the pid now belongs to a process that
+    is not Chrome or Chromium (pid reuse). Raises ChromeStartError when a live Chrome or Chromium
+    has that pid (whatever profile path it was given), when the lock names another host, or when
+    the lock cannot be read: those are left alone.
     """
+    try:
+        target = os.readlink(profile_dir / "SingletonLock")
+    except OSError:
+        return False
     owner = singleton_lock_owner(profile_dir)
     if owner is None:
         return False
@@ -164,17 +197,14 @@ def remove_stale_singleton(profile_dir: Path) -> bool:
             f"The Chrome profile {profile_dir} is locked by host {host} (pid {pid}), not this Mac; "
             "quit Chrome there or delete its SingletonLock."
         )
-    if _pid_alive(pid) and _process_uses_profile(pid, profile_dir):
+    if _pid_alive(pid) and _process_is_chrome(pid):
         raise ChromeStartError(
-            f"Chrome pid {pid} already uses the profile {profile_dir} but its debug port is closed; "
-            "quit that Chrome and run again."
+            f"Chrome pid {pid} holds the profile lock in {profile_dir} and is still running, but "
+            "nothing answers on the debug port; quit that Chrome and run again."
         )
-    for name in SINGLETON_FILES:
-        try:
-            (profile_dir / name).unlink()
-        except FileNotFoundError:
-            pass
-    logger.info("Removed a stale Chrome profile lock (pid %d is gone)", pid)
+    if not _remove_singleton_if_unchanged(profile_dir, target):
+        return False
+    logger.info("Removed a stale Chrome profile lock (pid %d is dead or reused)", pid)
     return True
 
 
@@ -192,7 +222,12 @@ def stop_chrome(proc, profile_dir: Path, timeout: float = CHROME_STOP_TIMEOUT_SE
         except subprocess.TimeoutExpired:
             logger.warning("Chrome pid %d did not stop within %ss, killing it", proc.pid, timeout)
             proc.kill()
-            proc.wait(timeout=10)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.error("Chrome pid %d still running 10 s after SIGKILL; profile lock left in place",
+                             proc.pid)
+                return
         logger.info("Stopped the Chrome this run started (pid %d)", proc.pid)
     try:
         remove_stale_singleton(profile_dir)
@@ -211,8 +246,14 @@ def ensure_chrome_running(port: int, profile_dir: Path, chrome_path,
         logger.info("Chrome already listening on debug port %d, attaching", port)
         return None
 
-    exe = find_chrome(chrome_path)
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        exe = find_chrome(chrome_path)
+    except FileNotFoundError as e:
+        raise ChromeStartError(str(e)) from None
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ChromeStartError(f"Cannot create the Chrome profile folder {profile_dir}: {e}") from None
     remove_stale_singleton(profile_dir)
 
     logger.info("Starting Chrome with profile %s", profile_dir)
@@ -255,8 +296,13 @@ def ensure_chrome_running(port: int, profile_dir: Path, chrome_path,
 
 
 def install_signal_handlers() -> None:
-    """SIGTERM and SIGHUP raise SystemExit (143, 129) so `finally` blocks run and stop Chrome."""
+    """SIGTERM and SIGHUP raise SystemExit (143, 129) so `finally` blocks run and stop Chrome.
+
+    After the first one both are ignored: a second TERM must not interrupt the cleanup it started.
+    """
     def handler(signum, _frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, handler)
@@ -445,9 +491,19 @@ def parse_args() -> argparse.Namespace:
                         help="Chrome remote debugging port (default: %(default)s)")
     parser.add_argument("--chrome-path", type=str, default=None,
                         help="Full path to chrome.exe if it is not in a standard location")
-    parser.add_argument("--chrome-start-timeout", type=float, default=CHROME_START_TIMEOUT_SECONDS,
+    parser.add_argument("--chrome-start-timeout", type=positive_seconds, default=CHROME_START_TIMEOUT_SECONDS,
                         help="Seconds to wait for a started Chrome to open its debug port (default: %(default)s)")
     return parser.parse_args()
+
+
+def positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if not seconds > 0:  # also rejects nan
+        raise argparse.ArgumentTypeError(f"must be more than 0 seconds, got {value}")
+    return seconds
 
 
 def main() -> None:
@@ -483,9 +539,14 @@ def main() -> None:
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = context.pages[0] if context.pages else context.new_page()
+            try:
+                browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
+            except PlaywrightError as e:
+                first_line = (str(e).strip().splitlines() or ["no detail"])[0]
+                logger.error("Could not connect to Chrome on debug port %d: %s", args.port, first_line)
+                sys.exit(1)
 
             try:
                 if "idx.co.id" not in page.url or page_is_challenge(page):

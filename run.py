@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -22,6 +23,9 @@ MASTER_SCRIPT = "model/master-data.py"
 FETCH_SCRIPT = "model/fetch_idx.py"
 PARSE_SCRIPT = "model/arelle_loader.py"
 EXPORT_SCRIPT = "model/sqlite_export.py"
+# How long a step may take to clean up after it was told to stop (fetch_idx.py stops its Chrome:
+# up to 15 s, then 10 s after a SIGKILL).
+STEP_STOP_TIMEOUT_SECONDS = 60
 # model/backfill_cdp.py is NOT part of this pipeline: it needs a Chrome with a
 # remote-debugging port already running, and drives CDP directly (see the module
 # docstring). Run it separately to pull historical years, then re-run this
@@ -84,16 +88,68 @@ def resolve_chrome_path(explicit: Optional[str]) -> Optional[Path]:
     return None
 
 
+def _wait_for_step(proc: subprocess.Popen) -> None:
+    """Wait for a step that was told to stop; SIGKILL it after STEP_STOP_TIMEOUT_SECONDS."""
+    try:
+        proc.wait(timeout=STEP_STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.error("Step pid %d did not stop within %ss, killing it", proc.pid, STEP_STOP_TIMEOUT_SECONDS)
+        proc.kill()
+        proc.wait()
+
+
 def run_step(name: str, script: str, args: list) -> None:
     command = [sys.executable, str(SCRIPT_DIR / script), *args]
     logger.info("Step started: %s", name)
     started = time.time()
 
-    result = subprocess.run(command)
+    proc = subprocess.Popen(command)
+
+    # A TERM or HUP to this process (deploy/scraper.sh, launchd) is passed on to the running step
+    # as TERM, so it can clean up (fetch_idx.py stops the Chrome it started); this process waits
+    # for it, up to STEP_STOP_TIMEOUT_SECONDS, and exits with 128 + the signal. Further TERM/HUP
+    # are ignored meanwhile. The handler only sends the signal: waiting inside it would re-enter
+    # Popen.wait and deadlock on its lock, so the loop below does the waiting.
+    received = []
+
+    def forward(signum, _frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        if received:
+            return
+        received.append(signum)
+        logger.error("Received signal %d, stopping step '%s'", signum, name)
+        if proc.poll() is None:
+            proc.terminate()
+
+    previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGHUP)}
+    stop_deadline = None
+    try:
+        while proc.poll() is None:
+            if received:
+                if stop_deadline is None:
+                    stop_deadline = time.monotonic() + STEP_STOP_TIMEOUT_SECONDS
+                elif time.monotonic() > stop_deadline:
+                    logger.error("Step '%s' did not stop within %ss, killing it", name, STEP_STOP_TIMEOUT_SECONDS)
+                    proc.kill()
+                    proc.wait()
+                    break
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        # Ctrl-C reaches the step too (same process group); let it finish its own cleanup.
+        _wait_for_step(proc)
+        raise
+    finally:
+        for s, handler in previous.items():
+            if signal.getsignal(s) is forward:
+                signal.signal(s, handler)
+    if received:
+        raise SystemExit(128 + received[0])
+    returncode = proc.returncode
     elapsed = time.time() - started
 
-    if result.returncode != 0:
-        raise RuntimeError(f"Step '{name}' failed with exit code {result.returncode}")
+    if returncode != 0:
+        raise RuntimeError(f"Step '{name}' failed with exit code {returncode}")
 
     logger.info("Step finished: %s (%.1f seconds)", name, elapsed)
 

@@ -1,12 +1,16 @@
 """Tests for the Chrome start and cleanup in model/fetch_idx.py and the signal hand-off in run.py.
 
-No real Chrome and no network: a fake "Chrome" (a small Python script) takes the same arguments,
+No network. Most tests use a fake "Chrome" (a small Python script) that takes the same arguments,
 writes a SingletonLock like Chrome does and answers /json/version on the DevTools port, or not,
-depending on FAKE_CHROME_MODE.
+depending on FAKE_CHROME_MODE. The in-flight signal tests need a real Playwright call, so they run
+the installed Google Chrome headless against a local HTTP server (skipped when Chrome is missing).
 
     python3 -m unittest discover -s tests -v
 """
+import http.server
+import importlib
 import logging
+import threading
 import os
 import re
 import signal
@@ -22,6 +26,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "model"))
+sys.path.insert(1, str(REPO))  # run.py
 
 import fetch_idx  # noqa: E402
 
@@ -89,6 +94,65 @@ def dead_pid() -> int:
     p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()
     return p.pid
+
+
+REAL_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def free_port_for_real_chrome() -> int:
+    """Real Chrome binds without SO_REUSEPORT, so its port cannot stay reserved: bind, read, close."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class SlowSite:
+    """A local stand-in for idx.co.id. /file/... (the download fetch) blocks until released or 60 s.
+
+    /home blocks too when `block_home`, except its first request (Chrome's start page), so that the
+    request that blocks is page.goto() from open_idx_home().
+    """
+
+    def __init__(self, block_home: bool):
+        self.release = threading.Event()
+        self.home_requests = 0
+        self.home_blocked = threading.Event()
+        self.file_blocked = threading.Event()
+        site = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/home"):
+                    site.home_requests += 1
+                    if block_home and site.home_requests > 1:
+                        site.home_blocked.set()
+                        site.release.wait(60)
+                    body = b"<html><head><title>IDX test</title></head><body>ok</body></html>"
+                    status = 200
+                else:
+                    site.file_blocked.set()
+                    site.release.wait(60)
+                    body, status = b"", 404
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
 
 
 def wait_until(predicate, seconds=10.0):
@@ -186,13 +250,13 @@ class ChromeStartTest(unittest.TestCase):
     def test_lock_of_a_live_chrome_on_this_profile_is_refused(self):
         h = self.holder(str(self.profile))
         with self.assertRaisesRegex(fetch_idx.ChromeStartError, "pid %d" % h.pid):
-            fetch_idx.remove_stale_singleton(self.profile)
+            fetch_idx.remove_stale_singleton(self.profile, chrome_path=str(self.chrome))
         self.assertEqual(self.singleton_files(), ["SingletonLock"])
 
     def test_live_chrome_with_a_relative_profile_path_is_refused(self):
         h = self.holder("chrome_profile", cwd=str(self.tmp))
         with self.assertRaisesRegex(fetch_idx.ChromeStartError, "pid %d" % h.pid):
-            fetch_idx.remove_stale_singleton(self.profile)
+            fetch_idx.remove_stale_singleton(self.profile, chrome_path=str(self.chrome))
         self.assertEqual(self.singleton_files(), ["SingletonLock"])
 
     def test_live_chrome_via_tmp_or_private_tmp_is_refused(self):
@@ -204,7 +268,7 @@ class ChromeStartTest(unittest.TestCase):
             with self.subTest(holder=str(holder_path), checked=str(checked)):
                 h = self.holder(str(holder_path))
                 with self.assertRaisesRegex(fetch_idx.ChromeStartError, "pid %d" % h.pid):
-                    fetch_idx.remove_stale_singleton(checked)
+                    fetch_idx.remove_stale_singleton(checked, chrome_path=str(self.chrome))
                 self.assertEqual(self.singleton_files(real), ["SingletonLock"])
                 h.kill()
                 h.wait()
@@ -213,7 +277,65 @@ class ChromeStartTest(unittest.TestCase):
     def test_live_chrome_with_a_trailing_slash_is_refused(self):
         h = self.holder(str(self.profile) + "/")
         with self.assertRaisesRegex(fetch_idx.ChromeStartError, "pid %d" % h.pid):
+            fetch_idx.remove_stale_singleton(self.profile, chrome_path=str(self.chrome))
+
+    # --- which process counts as a Chrome -----------------------------------------------------
+
+    def test_program_name_is_the_executable_or_the_interpreted_script(self):
+        py = "/opt/py/Python.app/Contents/MacOS/Python"
+        cases = [
+            (REAL_CHROME, REAL_CHROME + " --remote-debugging-port=9222", "Google Chrome"),
+            ("/Users/a/My -Apps/Chromium.app/Contents/MacOS/Chromium",
+             "/Users/a/My -Apps/Chromium.app/Contents/MacOS/Chromium --user-data-dir=/p", "Chromium"),
+            (py, py + " /tmp/x/fake-chrome --remote-debugging-port=1", "fake-chrome"),
+            ("/usr/bin/env", "/usr/bin/env python3 /tmp/x/fake-chrome --x=1", "fake-chrome"),
+            ("/bin/sleep", "sleep 30", "sleep"),
+            ("", "", ""),
+        ]
+        for comm, args, want in cases:
+            with self.subTest(comm=comm):
+                self.assertEqual(fetch_idx._program_name(comm, args), want)
+
+    def test_only_chrome_chromium_or_the_configured_browser_count(self):
+        is_chrome = fetch_idx._is_chrome_program
+        for name in ("Google Chrome", "Google Chrome Canary", "Google Chrome for Testing", "Chromium",
+                     "chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome.exe"):
+            with self.subTest(name=name):
+                self.assertTrue(is_chrome(name))
+        for name in ("Google Chrome Helper", "Google Chrome Helper (Renderer)", "Chromium Helper (GPU)",
+                     "Python", "sleep", "Brave Browser", "chrome-headless-shell", ""):
+            with self.subTest(name=name):
+                self.assertFalse(is_chrome(name))
+        brave = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+        self.assertTrue(is_chrome("Brave Browser", chrome_path=brave))
+        self.assertTrue(is_chrome("kiosk", chrome_path="/opt/browser/bin/kiosk"))
+        self.assertFalse(is_chrome("Google Chrome Helper (Renderer)", chrome_path=REAL_CHROME))
+
+    def test_a_script_not_named_like_chrome_is_not_a_chrome_without_chrome_path(self):
+        h = self.holder(str(self.profile))
+        self.assertTrue(fetch_idx.remove_stale_singleton(self.profile))
+        self.assertTrue(pid_alive(h.pid))
+
+    def test_lock_of_a_reused_pid_that_is_a_chrome_helper_is_stale(self):
+        helpers = subprocess.run(["pgrep", "-f", "Google Chrome Helper"], capture_output=True, text=True).stdout.split()
+        if not helpers:
+            self.skipTest("no Google Chrome Helper process running")
+        self.plant_lock("%s-%s" % (socket.gethostname(), helpers[0]))
+        self.assertTrue(fetch_idx.remove_stale_singleton(self.profile, chrome_path=REAL_CHROME))
+        self.assertEqual(self.singleton_files(), [])
+
+    def test_a_live_real_chrome_holding_the_profile_is_refused(self):
+        if not os.path.exists(REAL_CHROME):
+            self.skipTest("Google Chrome not installed")
+        h = subprocess.Popen([REAL_CHROME, "--headless=new", "--remote-debugging-port=%d" % free_port_for_real_chrome(),
+                              "--user-data-dir=%s" % self.profile, "--no-first-run", "about:blank"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.procs.append(h)
+        self.assertTrue(wait_until(lambda: os.path.lexists(self.profile / "SingletonLock"), 30))
+        with self.assertRaisesRegex(fetch_idx.ChromeStartError, "pid %d" % h.pid):
             fetch_idx.remove_stale_singleton(self.profile)
+        fetch_idx.stop_chrome(h, self.profile)
+        self.assertEqual(self.singleton_files(), [])
 
     def test_lock_changed_while_checked_is_left_in_place(self):
         self.plant_lock("%s-%d" % (socket.gethostname(), os.getpid()))
@@ -399,7 +521,7 @@ class ChromeStartTest(unittest.TestCase):
         self.assertEqual(len(re.findall(r"\[ERROR\]", r.stderr)), 1, r.stderr)
 
     def test_start_timeout_must_be_positive(self):
-        for value in ("0", "-5", "nan", "abc"):
+        for value in ("0", "-5", "nan", "inf", "-inf", "abc"):
             with self.subTest(value=value):
                 r = subprocess.run(self.fetch_cmd("--chrome-start-timeout", value),
                                    capture_output=True, text=True, timeout=60)
@@ -407,9 +529,6 @@ class ChromeStartTest(unittest.TestCase):
                 self.assertIn("--chrome-start-timeout", r.stderr)
 
     def test_run_py_passes_term_and_hup_to_the_download_step(self):
-        # run.py has no --port: fetch_idx.py uses the default 9222, which must be free here.
-        if fetch_idx.debug_port_is_open(fetch_idx.DEFAULT_DEBUG_PORT):
-            self.skipTest("something listens on port %d" % fetch_idx.DEFAULT_DEBUG_PORT)
         for sig, code_expected in ((signal.SIGTERM, 143), (signal.SIGHUP, 129)):
             with self.subTest(signal=sig):
                 data = self.tmp / ("run-%d" % sig)
@@ -417,7 +536,7 @@ class ChromeStartTest(unittest.TestCase):
                 p = subprocess.Popen(
                     [sys.executable, str(REPO / "run.py"), "--skip-master", "--skip-parse",
                      "--data-dir", str(data), "--watchlist", str(self.tmp / "watchlist.csv"),
-                     "--chrome-path", str(self.chrome)],
+                     "--chrome-path", str(self.chrome), "--port", str(self.port)],
                     env=dict(os.environ, FAKE_CHROME_DELAY="30"), stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, text=True)
                 self.procs.append(p)
@@ -433,6 +552,92 @@ class ChromeStartTest(unittest.TestCase):
                 left = subprocess.run(["pgrep", "-f", "fetch_idx.py --data-dir %s" % data],
                                       capture_output=True, text=True).stdout.strip()
                 self.assertEqual(left, "", "fetch_idx.py still running")
+
+    def test_run_py_installs_its_handlers_before_the_step_starts(self):
+        """A TERM that arrives while Popen is still starting the step must not be lost."""
+        run = importlib.import_module("run")
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items()])
+        step = self.tmp / "step.py"
+        step.write_text("import time\ntime.sleep(30)\n")
+        real_popen = subprocess.Popen
+        seen = {}
+
+        def popen_with_a_signal_in_flight(*a, **kw):
+            handler = signal.getsignal(signal.SIGTERM)
+            seen["handler"] = handler
+            proc = real_popen(*a, **kw)
+            self.procs.append(proc)
+            if callable(handler):
+                handler(signal.SIGTERM, None)  # the TERM lands before run_step has the Popen object
+            return proc
+
+        with mock.patch.object(run.subprocess, "Popen", side_effect=popen_with_a_signal_in_flight):
+            with self.assertRaises(SystemExit) as ctx:
+                run.run_step("test step", str(step), [])
+        self.assertTrue(callable(seen["handler"]), "SIGTERM had the default action while Popen ran")
+        self.assertEqual(ctx.exception.code, 143)
+        self.assertEqual(self.procs[-1].returncode, -signal.SIGTERM)
+
+    # --- TERM while a real Playwright call is in flight (headless Google Chrome, local site) ------
+
+    def run_main_until_blocked(self, site, blocked: threading.Event):
+        """fetch_idx.main() against `site`; (process, Chrome pid, log path) once `blocked` is set."""
+        if not os.path.exists(REAL_CHROME):
+            self.skipTest("Google Chrome not installed")
+        wrapper = self.tmp / "headless-chrome"
+        wrapper.write_text('#!/bin/sh\nexec "%s" --headless=new "$@"\n' % REAL_CHROME)
+        wrapper.chmod(0o755)
+        (self.tmp / "watchlist.csv").write_text("ticker\nUNTR\n")
+        base = "http://127.0.0.1:%d" % site.port
+        code = textwrap.dedent(
+            """\
+            import sys
+            sys.path.insert(0, %r)
+            import fetch_idx
+            fetch_idx.IDX_HOME = %r
+            fetch_idx.IDX_URL_TEMPLATE = %r
+            sys.argv = ["fetch_idx.py"] + %r
+            fetch_idx.main()
+            """
+        ) % (str(REPO / "model"), base + "/home", base + "/file/{year}/{period_folder}/{ticker}/instance.zip",
+             ["--data-dir", str(self.tmp / "data"), "--watchlist", str(self.tmp / "watchlist.csv"),
+              "--start-year", "2025", "--end-year", "2025", "--periods", "FY",
+              "--port", str(free_port_for_real_chrome()), "--chrome-path", str(wrapper)])
+        log = self.tmp / "main.log"
+        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=open(log, "w"))
+        self.procs.append(p)
+        self.assertTrue(blocked.wait(90), "the Playwright call never reached the site:\n" + log.read_text())
+        time.sleep(0.5)
+        chrome_pid = int(re.search(r"open after [0-9.]+s \(pid (\d+)\)", log.read_text()).group(1))
+        return p, chrome_pid, log
+
+    def assert_term_ends_it(self, p, chrome_pid, log):
+        # Whatever happens, never leave the real Chrome behind.
+        self.addCleanup(lambda: pid_alive(chrome_pid) and os.kill(chrome_pid, signal.SIGKILL))
+        sent = time.monotonic()
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("still running 15 s after TERM:\n" + log.read_text())
+        text = log.read_text()
+        self.assertEqual(p.returncode, 143, text)
+        self.assertLess(time.monotonic() - sent, 10, text)
+        self.assertNotIn("Traceback", text)
+        self.assertIn("Stopped the Chrome this run started (pid %d)" % chrome_pid, text)
+        self.assertFalse(pid_alive(chrome_pid))
+        self.assertEqual(self.singleton_files(self.tmp / "data" / "chrome_profile"), [])
+
+    def test_term_during_page_goto_exits_143_and_stops_chrome(self):
+        site = SlowSite(block_home=True)  # open_idx_home's page.goto() is the call in flight
+        self.addCleanup(site.close)
+        self.assert_term_ends_it(*self.run_main_until_blocked(site, site.home_blocked))
+
+    def test_term_during_page_evaluate_exits_143_and_stops_chrome(self):
+        site = SlowSite(block_home=False)  # the download fetch, page.evaluate(), is in flight
+        self.addCleanup(site.close)
+        self.assert_term_ends_it(*self.run_main_until_blocked(site, site.file_blocked))
 
 
 if __name__ == "__main__":
